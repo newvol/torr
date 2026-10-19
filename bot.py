@@ -91,11 +91,18 @@ async def read_page(browser, url):
                 "status": response.status,
                 "type": content_type[:100],
             }
-            if ("json" in content_type.lower() or "text/" in content_type.lower()) and len(network) < 35:
+            if ("json" in content_type.lower() or "text/" in content_type.lower() or "javascript" in content_type.lower()) and len(network) < 50:
                 try:
                     body = await response.text()
                     if body:
-                        item["sample"] = norm(body)[:350]
+                        if "javascript" in content_type.lower():
+                            # Extract likely API paths from the public widget bundle, not the full JS.
+                            paths = sorted(set(re.findall(r"""(?:https?://[A-Za-z0-9.-]+)?/api/[A-Za-z0-9_./?={}&%-]+""", body)))
+                            item["api_paths"] = paths[:80]
+                            keys = sorted(set(re.findall(r"""[A-Za-z0-9_]*(?:schedule|outage|queue|gpv|power|option)[A-Za-z0-9_]*""", body, re.I)))
+                            item["data_keys"] = keys[:80]
+                        else:
+                            item["sample"] = norm(body)[:350]
                 except Exception:
                     pass
             if len(network) < 50:
