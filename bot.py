@@ -1,11 +1,11 @@
 import asyncio
-import hashlib
 import json
 import logging
 import os
 import re
 from datetime import datetime, time, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -19,11 +19,11 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 STATE_PATH = Path(os.getenv("STATE_FILE", "/data/state.json"))
 CHECK_SECONDS = max(60, int(os.getenv("CHECK_EVERY_SECONDS", "300")))
 SCHEDULE_URL = "https://energy.volyn.ua/spozhyvacham/perervy-u-elektropostachanni/hrafik-vidkliuchen/"
-OUTAGES_URL = "https://www.energy.volyn.ua/spozhyvacham/perervy-u-elektropostachanni/chomu-nemaie-elektropostachannia/"
+OUTAGES_URL = "https://energy.volyn.ua/spozhyvacham/perervy-u-elektropostachanni/chomu-nemaie-elektropostachannia/"
 QUEUE_WIDGET_URL = "https://voe-poweron.inneti.net/schedule_queues"
 QUEUES = [{"name": "Литовеж", "queue": "4.2"}, {"name": "Нововолинськ", "queue": "2.2"}]
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-# Prevent HTTP client request logs from printing Telegram API URLs that contain the bot token.
+# Never log HTTP request URLs for Telegram: they contain the bot token.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("volyn-bot")
@@ -47,6 +47,12 @@ def norm(s):
     return re.sub(r"\s+", " ", (s or "").replace("\xa0", " ")).strip()
 
 
+def safe_url(url):
+    parts = urlsplit(url)
+    # Drop query and fragment to avoid logging keys/tokens from third-party URLs.
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
     chat_id = update.effective_chat.id
@@ -56,40 +62,74 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Монітор Волиньобленерго активний.\n"
         "Литовеж — черга 4.2; Нововолинськ — черга 2.2.\n"
-        "Команди: /status, /today, /tomorrow.\n"
-        "Примітка: графік надсилається лише після підтвердження коректного читання офіційного віджета."
+        "Команди: /status, /today, /tomorrow."
     )
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
     last = state.get("last_check", "ще не перевірявся")
-    err = state.get("last_error")
-    msg = f"Остання перевірка джерела: {last}\nІнтервал перевірки: {CHECK_SECONDS // 60} хв.\n"
-    msg += "Стан парсера: валідація джерела не завершена; неперевірені години не надсилаються."
-    if err:
-        msg += f"\nОстання помилка: {err[:250]}"
-    msg += f"\nОфіційний графік: {SCHEDULE_URL}\nОголошення про перерви: {OUTAGES_URL}"
+    msg = f"Остання перевірка джерела: {last}\nІнтервал: {CHECK_SECONDS // 60} хв.\n"
+    msg += "Зчитування годин графіка: ще не підтверджене."
+    for p in state.get("source_pages", []):
+        msg += f"\n{p.get('title', '')}: {p.get('chars', 0)} символів"
+    if state.get("last_error"):
+        msg += f"\nПомилка: {state['last_error'][:200]}"
+    msg += f"\nОфіційний графік: {SCHEDULE_URL}"
     await update.message.reply_text(msg, disable_web_page_preview=True)
 
 
 async def read_page(browser, url):
     page = await browser.new_page()
+    network = []
+    async def on_response(response):
+        try:
+            parts = urlsplit(response.url)
+            content_type = response.headers.get("content-type", "")
+            item = {
+                "url": safe_url(response.url),
+                "status": response.status,
+                "type": content_type[:100],
+            }
+            if ("json" in content_type.lower() or "text/" in content_type.lower()) and len(network) < 35:
+                try:
+                    body = await response.text()
+                    if body:
+                        item["sample"] = norm(body)[:350]
+                except Exception:
+                    pass
+            if len(network) < 50:
+                network.append(item)
+        except Exception:
+            pass
+    page.on("response", on_response)
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
         try:
             await page.wait_for_load_state("networkidle", timeout=12000)
         except PlaywrightTimeoutError:
             pass
-        await page.wait_for_timeout(2500)
-        text = await page.locator("body").inner_text(timeout=10000)
-        return {"url": page.url, "title": await page.title(), "text": norm(text)}
+        await page.wait_for_timeout(3500)
+        text = norm(await page.locator("body").inner_text(timeout=10000))
+        frames = []
+        for frame in page.frames:
+            frames.append({"url": safe_url(frame.url), "name": frame.name})
+        iframe_srcs = await page.locator("iframe").evaluate_all(
+            "(els) => els.map(e => e.src).filter(Boolean).map(u => { const x = new URL(u); return x.origin + x.pathname; })"
+        )
+        return {
+            "url": safe_url(page.url),
+            "title": await page.title(),
+            "text": text,
+            "frames": frames[:20],
+            "iframe_srcs": iframe_srcs[:20],
+            "network": network[:35],
+        }
     finally:
         await page.close()
 
 
 def queue_context(text, queue):
-    # Only a diagnostic snippet; not yet sufficient to identify date/hour cells safely.
     hits = []
     pos = 0
     while True:
@@ -112,24 +152,36 @@ async def poll(context: ContextTypes.DEFAULT_TYPE):
                     try:
                         pages.append(await read_page(browser, url))
                     except Exception as exc:
-                        log.warning("Could not read %s: %s", url, exc)
+                        log.warning("Could not read source %s: %s", safe_url(url), str(exc)[:180])
                 if not pages:
                     raise RuntimeError("Не вдалося прочитати жодне офіційне джерело")
-                # Keep only successful source availability diagnostics. Do not treat arbitrary HTML
-                # changes as schedule changes; the official queue/date/hour data needs validation.
                 state["last_check"] = datetime.now(TZ).isoformat(timespec="seconds")
-                state["source_pages"] = [{"url": p["url"], "title": p["title"], "chars": len(p["text"])} for p in pages]
+                state["source_pages"] = [
+                    {
+                        "url": p["url"], "title": p["title"], "chars": len(p["text"]),
+                        "frames": p["frames"], "iframe_srcs": p["iframe_srcs"],
+                        "network": p["network"],
+                    }
+                    for p in pages
+                ]
                 state["last_error"] = ""
-                log.info("Fetched pages: %s", state["source_pages"])
-                # Record candidate queue snippets for diagnostics without sending false alerts.
+                # Safe diagnostics: response URLs have query strings stripped.
+                for p in pages:
+                    log.info("Source diagnostic: %s", json.dumps({
+                        "url": p["url"], "title": p["title"], "chars": len(p["text"]),
+                        "frames": p["frames"], "iframe_srcs": p["iframe_srcs"],
+                        "network": p["network"][:20],
+                    }, ensure_ascii=False)[:6000])
                 widget = next((x for x in pages if "schedule_queues" in x["url"]), None)
                 if widget:
-                    state["queue_candidates"] = {q["queue"]: queue_context(widget["text"], q["queue"])[:4] for q in QUEUES}
+                    state["queue_candidates"] = {
+                        q["queue"]: queue_context(widget["text"], q["queue"])[:4] for q in QUEUES
+                    }
                 save_state(state)
             finally:
                 await browser.close()
     except Exception as exc:
-        state["last_error"] = f"{type(exc).__name__}: {str(exc)}"
+        state["last_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
         save_state(state)
         log.exception("Schedule check failed")
 
@@ -143,8 +195,8 @@ async def daily(context: ContextTypes.DEFAULT_TYPE):
     message = (
         f"📅 Графік на завтра — {tomorrow}\n"
         "Литовеж — черга 4.2; Нововолинськ — черга 2.2.\n"
-        "Автоматичне зчитування погодинних блоків ще перевіряється, тому не хочу вигадувати години. "
-        "Відкрийте офіційний графік: " + SCHEDULE_URL
+        "Години поки не підтверджені автоматичним зчитуванням. Перевірте офіційний графік: "
+        + SCHEDULE_URL
     )
     for chat_id in state.get("chats", []):
         try:
@@ -157,16 +209,15 @@ async def daily(context: ContextTypes.DEFAULT_TYPE):
 
 async def send_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Поточні години черг 4.2 і 2.2 ще не підтверджено автоматичним парсером. "
-        "Перевірте офіційний графік: " + SCHEDULE_URL,
+        "Години черг 4.2 і 2.2 ще не підтверджені парсером. Офіційний графік: " + SCHEDULE_URL,
         disable_web_page_preview=True,
     )
 
 
 async def send_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Графік на завтра: години не надсилаю, доки не перевірено зчитування офіційного віджета. "
-        "Черги: Литовеж 4.2, Нововолинськ 2.2. " + SCHEDULE_URL,
+        "Години на завтра ще не підтверджені парсером. Черги: Литовеж 4.2, Нововолинськ 2.2. "
+        + SCHEDULE_URL,
         disable_web_page_preview=True,
     )
 
