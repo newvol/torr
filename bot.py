@@ -23,6 +23,9 @@ OUTAGES_URL = "https://www.energy.volyn.ua/spozhyvacham/perervy-u-elektropostach
 QUEUE_WIDGET_URL = "https://voe-poweron.inneti.net/schedule_queues"
 QUEUES = [{"name": "Литовеж", "queue": "4.2"}, {"name": "Нововолинськ", "queue": "2.2"}]
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# Prevent HTTP client request logs from printing Telegram API URLs that contain the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("volyn-bot")
 
 
